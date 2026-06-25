@@ -7,12 +7,27 @@ static AKAMAI_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"Reference #\d+\.[0-9a-f]+\.\d+\.[0-9a-f]+").expect("static regex")
 });
 
+/// Borrow the first `max` bytes of `html`, backing off to the nearest char
+/// boundary so a multi-byte UTF-8 sequence is never split.
+///
+/// Slicing a `&str` at a non-boundary byte panics. Response bodies are
+/// lossy-decoded to UTF-8, so binary content (e.g. a `.zip` reachable from a
+/// docs site) becomes a run of `U+FFFD` replacement chars — 3 bytes each — any
+/// of which can straddle a fixed offset like 500_000. Flooring to a boundary
+/// keeps the slice safe; we lose at most two bytes off the cap.
+fn prefix(html: &str, max: usize) -> &str {
+    let mut end = html.len().min(max);
+    while end > 0 && !html.is_char_boundary(end) {
+        end -= 1;
+    }
+    &html[..end]
+}
+
 /// Heuristic: does the HTML look like an SPA shell that needs JS rendering?
 pub fn needs_js_rendering(html: &str) -> bool {
     // Check up to 500KB — some pages have huge <head> sections (CSS, preloaded data)
     // and the <body> may start well beyond 50KB.
-    let check_len = html.len().min(500_000);
-    let lower = html[..check_len].to_lowercase();
+    let lower = prefix(html, 500_000).to_lowercase();
     let body_len = extract_body_text_len(&lower);
 
     // Very short body text + presence of JS framework indicators.
@@ -139,7 +154,7 @@ pub fn looks_like_vendor_block(html: &str) -> Option<&'static str> {
     if html.len() > 200_000 {
         return None;
     }
-    let head = &html[..html.len().min(15_000)];
+    let head = prefix(html, 15_000);
     let lower_head = head.to_lowercase();
 
     // Cloudflare: challenge form with cf-managed token, error code span, or
@@ -203,8 +218,7 @@ pub fn looks_like_vendor_block(html: &str) -> Option<&'static str> {
 /// on raw markup, looking for framework shells. This one is purely about
 /// outcome — does the page have *any* content for an extractor to chew on.
 pub fn looks_like_thin_html(html: &str) -> bool {
-    let check_len = html.len().min(500_000);
-    let lower = html[..check_len].to_lowercase();
+    let lower = prefix(html, 500_000).to_lowercase();
     extract_body_text_len(&lower) < 200
 }
 
@@ -820,5 +834,40 @@ mod tests {
         // since scripts are stripped before text-length measurement.
         let html = r#"<html><body><article><h1>Real Article</h1><p>This is a real article with substantial content about the topic at hand, providing useful information.</p><script>const x = 'class="spinner"';</script></article></body></html>"#;
         assert!(!looks_like_loading_placeholder(html));
+    }
+
+    #[test]
+    fn prefix_never_splits_a_multibyte_char() {
+        // '€' is 3 bytes; with a 1-byte filler the cap lands mid-codepoint.
+        let mut html = "a".repeat(9_999);
+        html.push('€'); // byte 10_000 falls inside the 3-byte sequence
+        let p = prefix(&html, 10_000);
+        assert!(html.is_char_boundary(p.len()));
+        assert_eq!(p.len(), 9_999); // backed off to the boundary before '€'
+    }
+
+    // Regression (crw /map panic): a lossy-decoded binary body (e.g. a .zip
+    // reachable from a docs site) is a run of multi-byte U+FFFD chars; one
+    // straddling a fixed byte cap used to panic with "byte index N is not a
+    // char boundary". All three scanners must tolerate it.
+    fn boundary_straddling_html(cap: usize) -> String {
+        let mut html = "a".repeat(cap - 1);
+        html.push('€'); // 3 bytes: byte `cap` is mid-codepoint
+        html
+    }
+
+    #[test]
+    fn needs_js_rendering_handles_non_char_boundary_cap() {
+        let _ = needs_js_rendering(&boundary_straddling_html(500_000)); // must not panic
+    }
+
+    #[test]
+    fn looks_like_thin_html_handles_non_char_boundary_cap() {
+        let _ = looks_like_thin_html(&boundary_straddling_html(500_000)); // must not panic
+    }
+
+    #[test]
+    fn looks_like_vendor_block_handles_non_char_boundary_cap() {
+        let _ = looks_like_vendor_block(&boundary_straddling_html(15_000)); // must not panic
     }
 }
